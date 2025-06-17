@@ -1,0 +1,8 @@
+opencv-python==4.8.0.76
+numpy>=1.26.0
+python-chess==1.9.4
+fastapi==0.104.1
+uvicorn==0.24.0
+python-multipart==0.0.6
+stockfish==3.28.0
+Pillow==10.1.0 

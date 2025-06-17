@@ -2,14 +2,60 @@ import cv2
 import numpy as np
 import os
 from datetime import datetime
+import chess
+import chess.engine
 
 def get_square_roi(img, x, y, width, height):
     """Get the region of interest for a specific square."""
     return img[y:y+height, x:x+width]
 
+def validate_piece_counts(pieces):
+    """
+    Validate and adjust piece counts according to chess rules.
+    Returns a list of valid pieces.
+    """
+    # Initialize counters
+    piece_counts = {
+        'white': {'king': 0, 'queen': 0, 'bishop': 0, 'knight': 0, 'rook': 0, 'pawn': 0},
+        'black': {'king': 0, 'queen': 0, 'bishop': 0, 'knight': 0, 'rook': 0, 'pawn': 0}
+    }
+    
+    # Count pieces
+    for piece in pieces:
+        color = piece['color']
+        piece_type = piece['type']
+        piece_counts[color][piece_type] += 1
+    
+    # Validate and adjust pieces
+    valid_pieces = []
+    for piece in pieces:
+        color = piece['color']
+        piece_type = piece['type']
+        
+        # Check if piece count exceeds maximum
+        max_count = {
+            'king': 1,
+            'queen': 1,
+            'bishop': 2,
+            'knight': 2,
+            'rook': 2,
+            'pawn': 8
+        }
+        
+        if piece_counts[color][piece_type] <= max_count[piece_type]:
+            valid_pieces.append(piece)
+        else:
+            # If exceeded, try to reclassify as a pawn if it's not already a pawn
+            if piece_type != 'pawn' and piece_counts[color]['pawn'] < 8:
+                piece['type'] = 'pawn'
+                piece_counts[color]['pawn'] += 1
+                valid_pieces.append(piece)
+    
+    return valid_pieces
+
 def detect_piece(square_roi):
     """
-    Detect if there's a piece in the square and determine its color.
+    Detect if there's a piece in the square and determine its color and type.
     Returns: (has_piece, is_white, piece_type)
     """
     if square_roi is None or square_roi.size == 0:
@@ -18,58 +64,134 @@ def detect_piece(square_roi):
     # Convert to grayscale
     gray = cv2.cvtColor(square_roi, cv2.COLOR_BGR2GRAY)
     
-    # Calculate average brightness
+    # Calculate average brightness and standard deviation
     avg_brightness = np.mean(gray)
-    
-    # Calculate standard deviation to detect piece presence
     std_dev = np.std(gray)
     
-    # Threshold for piece detection - lowered for better sensitivity
-    has_piece = std_dev > 20  # Adjusted threshold
+    # Threshold for piece detection
+    has_piece = std_dev > 20  # Increased threshold for better noise rejection
     
     if has_piece:
         # Determine piece color based on average brightness
         is_white = avg_brightness > 127
         
-        # Simple piece type detection based on shape analysis
-        contours, _ = cv2.findContours(gray, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Get contours for shape analysis
+        _, binary = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
         if contours:
             # Get the largest contour
             largest_contour = max(contours, key=cv2.contourArea)
             area = cv2.contourArea(largest_contour)
             perimeter = cv2.arcLength(largest_contour, True)
             
-            # Calculate circularity
+            # Calculate shape features
             circularity = 4 * np.pi * area / (perimeter * perimeter) if perimeter > 0 else 0
             
-            # Basic piece type classification
-            if circularity > 0.8:  # More circular
-                piece_type = "pawn"  # or queen/king
-            else:
-                piece_type = "other"  # rook, knight, bishop
-        else:
-            piece_type = "unknown"
+            # Get bounding box and its features
+            x, y, w, h = cv2.boundingRect(largest_contour)
+            aspect_ratio = float(w)/h if h > 0 else 0
             
-        return True, is_white, piece_type
+            # Calculate relative area
+            relative_area = area / (square_roi.shape[0] * square_roi.shape[1])
+            
+            # Calculate convex hull features
+            hull = cv2.convexHull(largest_contour)
+            hull_area = cv2.contourArea(hull)
+            solidity = float(area) / hull_area if hull_area > 0 else 0
+            
+            # Calculate Hu moments for shape matching
+            moments = cv2.moments(largest_contour)
+            hu_moments = cv2.HuMoments(moments)
+            
+            # Piece type classification based on multiple features
+            if relative_area < 0.1:  # Too small to be a piece
+                return False, None, None
+                
+            # King detection
+            if circularity > 0.85 and relative_area > 0.3 and solidity > 0.9:
+                piece_type = "king"
+            
+            # Queen detection
+            elif circularity > 0.75 and relative_area > 0.25 and solidity > 0.85:
+                piece_type = "queen"
+            
+            # Bishop detection
+            elif circularity > 0.7 and relative_area > 0.2 and solidity > 0.8:
+                piece_type = "bishop"
+            
+            # Knight detection
+            elif circularity > 0.6 and relative_area > 0.2 and solidity > 0.75:
+                piece_type = "knight"
+            
+            # Rook detection
+            elif circularity > 0.65 and relative_area > 0.2 and solidity > 0.8:
+                piece_type = "rook"
+            
+            # Pawn detection
+            elif circularity > 0.7 and relative_area > 0.15 and solidity > 0.8:
+                piece_type = "pawn"
+            
+            else:
+                # Default to pawn if no clear match
+                piece_type = "pawn"
+            
+            # Color-based refinement
+            if is_white:
+                # White pieces tend to have higher brightness
+                if piece_type in ["king", "queen"] and avg_brightness < 180:
+                    piece_type = "bishop"  # Downgrade to bishop if not bright enough
+                elif piece_type in ["bishop", "knight"] and avg_brightness < 160:
+                    piece_type = "pawn"  # Downgrade to pawn if not bright enough
+            else:
+                # Black pieces tend to have lower brightness
+                if piece_type in ["king", "queen"] and avg_brightness > 80:
+                    piece_type = "bishop"  # Downgrade to bishop if too bright
+                elif piece_type in ["bishop", "knight"] and avg_brightness > 100:
+                    piece_type = "pawn"  # Downgrade to pawn if too bright
+            
+            return True, is_white, piece_type
     
     return False, None, None
 
 def log_board_state(pieces, empty_squares):
     """Log the board state to the console."""
+    # Validate piece counts
+    valid_pieces = validate_piece_counts(pieces)
+    
     print("\n" + "=" * 50)
     print("CHESS BOARD STATE ANALYSIS")
     print("=" * 50)
     
-    print("\nDETECTED PIECES:")
+    # Group pieces by color
+    white_pieces = [p for p in valid_pieces if p['color'] == 'white']
+    black_pieces = [p for p in valid_pieces if p['color'] == 'black']
+    
+    print("\nWHITE PIECES:")
     print("-" * 30)
-    if pieces:
-        for piece in pieces:
-            print(f"Position: {piece['position']}")
-            print(f"Color: {piece['color']}")
-            print(f"Type: {piece['type']}")
-            print("-" * 30)
+    if white_pieces:
+        # Group by piece type
+        for piece_type in ['king', 'queen', 'bishop', 'knight', 'rook', 'pawn']:
+            type_pieces = [p for p in white_pieces if p['type'] == piece_type]
+            if type_pieces:
+                print(f"\n{piece_type.upper()}:")
+                for piece in type_pieces:
+                    print(f"  Position: {piece['position']}")
     else:
-        print("No pieces detected")
+        print("No white pieces detected")
+    
+    print("\nBLACK PIECES:")
+    print("-" * 30)
+    if black_pieces:
+        # Group by piece type
+        for piece_type in ['king', 'queen', 'bishop', 'knight', 'rook', 'pawn']:
+            type_pieces = [p for p in black_pieces if p['type'] == piece_type]
+            if type_pieces:
+                print(f"\n{piece_type.upper()}:")
+                for piece in type_pieces:
+                    print(f"  Position: {piece['position']}")
+    else:
+        print("No black pieces detected")
     
     print("\nEMPTY SQUARES:")
     print("-" * 30)
@@ -80,263 +202,189 @@ def log_board_state(pieces, empty_squares):
     
     print("\n" + "=" * 50)
 
-def detect_chessboard(image_path):
+def load_templates(template_dir='templates'):
+    """Load all piece templates from the templates directory, including tile color variants."""
+    templates = []
+    for fname in os.listdir(template_dir):
+        if fname.endswith('.png'):
+            path = os.path.join(template_dir, fname)
+            img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+            if img is not None:
+                # Parse piece code and tile color from filename
+                base = fname.replace('.png', '')
+                parts = base.split('_')
+                if len(parts) >= 3:
+                    color = 'W' if parts[0] == 'white' else 'B'
+                    if parts[1] == 'pawn':
+                        code = color + 'P'
+                    elif parts[1] == 'rook':
+                        code = color + 'R'
+                    elif parts[1] == 'knight':
+                        code = color + 'N'
+                    elif parts[1] == 'bishop':
+                        code = color + 'B'
+                    elif parts[1] == 'queen':
+                        code = color + 'Q'
+                    elif parts[1] == 'king':
+                        code = color + 'K'
+                    else:
+                        continue
+                    tile_color = parts[-1]  # 'white' or 'black'
+                    templates.append({'img': img, 'code': code, 'name': fname, 'tile_color': tile_color})
+    return templates
+
+def match_piece(square_roi, templates):
+    """Match the square ROI against all templates and return the best match code and score."""
+    best_score = -1
+    best_code = None
+    h, w = square_roi.shape[:2]
+    if h == 0 or w == 0:
+        return None, -1
+    for tpl in templates:
+        tpl_img = tpl['img']
+        if tpl_img is None or tpl_img.shape[0] == 0 or tpl_img.shape[1] == 0:
+            continue
+        # Resize template to match square if needed
+        try:
+            tpl_resized = cv2.resize(tpl_img, (w, h))
+        except Exception as e:
+            continue
+        # Convert both to grayscale
+        roi_gray = cv2.cvtColor(square_roi, cv2.COLOR_BGR2GRAY)
+        tpl_gray = cv2.cvtColor(tpl_resized, cv2.COLOR_BGR2GRAY)
+        # Template matching
+        res = cv2.matchTemplate(roi_gray, tpl_gray, cv2.TM_CCOEFF_NORMED)
+        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+        if max_val > best_score:
+            best_score = max_val
+            best_code = tpl['code']
+    # Threshold to avoid false positives
+    if best_score > 0.55:
+        return best_code, best_score
+    else:
+        return None, best_score
+
+def piece_code_to_fen_char(code):
+    mapping = {
+        'WP': 'P', 'WN': 'N', 'WB': 'B', 'WR': 'R', 'WQ': 'Q', 'WK': 'K',
+        'BP': 'p', 'BN': 'n', 'BB': 'b', 'BR': 'r', 'BQ': 'q', 'BK': 'k'
+    }
+    return mapping.get(code, '')
+
+def board_dict_to_fen(board_dict):
+    fen_rows = []
+    for rank in range(8, 0, -1):
+        row = ''
+        empty = 0
+        for file in 'abcdefgh':
+            square = f'{file}{rank}'
+            code = board_dict.get(square)
+            if code:
+                if empty > 0:
+                    row += str(empty)
+                    empty = 0
+                row += piece_code_to_fen_char(code)
+            else:
+                empty += 1
+        if empty > 0:
+            row += str(empty)
+        fen_rows.append(row)
+    fen = '/'.join(fen_rows) + ' w KQkq - 0 1'
+    return fen
+
+def best_move_from_fen(fen: str, engine_path: str, time_limit: float = 0.1) -> str:
+    board = chess.Board(fen)
+    with chess.engine.SimpleEngine.popen_uci(engine_path) as engine:
+        result = engine.play(board, chess.engine.Limit(time=time_limit))
+    return result.move.uci()
+
+def detect_chessboard_with_templates(image_path, template_dir='templates', output_path='detected-board.png', engine_path='stockfish'):
     """
-    Detect chessboard in the image and draw a rectangle around it.
-    Returns the image with the detected board highlighted and the crop coordinates.
+    Detect chessboard and pieces using template matching, mark detected pieces on the output image.
+    Fallback to edge/contour-based board detection if chessboard corners are not found.
     """
-    # Read the image
     img = cv2.imread(image_path)
     if img is None:
         raise ValueError(f"Could not read image at {image_path}")
-
-    # Create a copy for drawing
     result_img = img.copy()
-
-    # Convert to grayscale
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-    # Try to detect the full 8x8 board
     ret, corners = cv2.findChessboardCorners(gray, (7, 7), None)
-
+    board_found = False
     if ret:
-        print("Found internal corners of the chessboard")
-        
-        # Refine corner positions
+        # Standard chessboard detection
         criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
         corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
-
-        # Get the corners array
         corners = corners.reshape(-1, 2)
-
-        # Calculate the average square size
         square_size = np.mean([
             np.linalg.norm(corners[i+1] - corners[i])
             for i in range(len(corners)-1)
         ])
-
-        # Get the top-left and bottom-right corners of the full board
         min_x = int(np.min(corners[:, 0]) - square_size)
         max_x = int(np.max(corners[:, 0]) + square_size)
         min_y = int(np.min(corners[:, 1]) - square_size)
         max_y = int(np.max(corners[:, 1]) + square_size)
-
-        # Calculate square dimensions
         square_width = (max_x - min_x) // 8
         square_height = (max_y - min_y) // 8
-
-        # Draw rectangle around the full board with thicker lines
-        cv2.rectangle(result_img, (min_x, min_y), (max_x, max_y), (0, 0, 255), 3)
-
-        # Draw grid lines and detect pieces
-        pieces = []
-        empty_squares = []
-        
-        for row in range(8):
-            for col in range(8):
-                # Calculate square coordinates
-                x = min_x + col * square_width
-                y = min_y + row * square_height
-                
-                # Draw grid lines with thicker lines
-                if col < 7:  # Vertical lines
-                    cv2.line(result_img, (x + square_width, y), 
-                            (x + square_width, y + square_height), (0, 255, 0), 2)
-                if row < 7:  # Horizontal lines
-                    cv2.line(result_img, (x, y + square_height), 
-                            (x + square_width, y + square_height), (0, 255, 0), 2)
-                
-                # Get square ROI and detect piece
-                square_roi = get_square_roi(img, x, y, square_width, square_height)
-                has_piece, is_white, piece_type = detect_piece(square_roi)
-                
-                # Get square notation
-                square_notation = f"{chr(97+col)}{8-row}"
-                
-                if has_piece:
-                    # Draw piece indicator with thicker lines and filled circle
-                    color = (255, 255, 255) if is_white else (0, 0, 0)
-                    # Draw filled circle
-                    cv2.circle(result_img, 
-                             (x + square_width//2, y + square_height//2),
-                             square_width//3, color, -1)  # Filled circle
-                    # Draw outline
-                    cv2.circle(result_img, 
-                             (x + square_width//2, y + square_height//2),
-                             square_width//3, (0, 0, 255), 2)  # Red outline
-                    
-                    # Add piece information
-                    pieces.append({
-                        'position': square_notation,
-                        'color': 'white' if is_white else 'black',
-                        'type': piece_type
-                    })
-                    
-                    # Add text label with background
-                    label = f"{piece_type[0].upper()}"  # First letter of piece type
-                    text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
-                    text_x = x + (square_width - text_size[0]) // 2
-                    text_y = y + (square_height + text_size[1]) // 2
-                    
-                    # Draw text background with padding
-                    padding = 4
-                    cv2.rectangle(result_img, 
-                                (text_x - padding, text_y - text_size[1] - padding),
-                                (text_x + text_size[0] + padding, text_y + padding),
-                                (255, 255, 255), -1)
-                    
-                    # Draw text with thicker lines
-                    cv2.putText(result_img, label, 
-                              (text_x, text_y),
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-                else:
-                    empty_squares.append(square_notation)
-
-        # Add text with thicker lines
-        cv2.putText(result_img, "8x8 Chessboard Detected", (min_x, min_y - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
-
-        # Log the board state to console
-        log_board_state(pieces, empty_squares)
-
-        return result_img, (min_x, min_y, max_x, max_y), pieces
-
+        board_found = True
     else:
-        print("No chessboard detected. Trying alternative method...")
-        # Try edge detection
+        # Fallback: edge/contour-based detection
         edges = cv2.Canny(gray, 50, 150)
         contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        # Find the largest contour that could be a rectangle
         max_area = 0
         best_contour = None
-        
         for contour in contours:
             area = cv2.contourArea(contour)
-            if area > 1000:  # Filter out small contours
+            if area > 1000:
                 x, y, w, h = cv2.boundingRect(contour)
                 aspect_ratio = float(w)/h
-                if 0.8 < aspect_ratio < 1.2:  # Look for roughly square shapes
+                if 0.8 < aspect_ratio < 1.2:
                     if area > max_area:
                         max_area = area
                         best_contour = contour
-        
         if best_contour is not None:
             x, y, w, h = cv2.boundingRect(best_contour)
-            cv2.rectangle(result_img, (x, y), (x+w, y+h), (0, 0, 255), 3)
-            
-            # Calculate square dimensions
+            min_x, min_y, max_x, max_y = x, y, x+w, y+h
             square_width = w // 8
             square_height = h // 8
-            
-            # Draw grid lines and detect pieces
-            pieces = []
-            empty_squares = []
-            
-            for row in range(8):
-                for col in range(8):
-                    # Calculate square coordinates
-                    square_x = x + col * square_width
-                    square_y = y + row * square_height
-                    
-                    # Draw grid lines
-                    if col < 7:  # Vertical lines
-                        cv2.line(result_img, (square_x + square_width, square_y), 
-                                (square_x + square_width, square_y + square_height), (0, 255, 0), 2)
-                    if row < 7:  # Horizontal lines
-                        cv2.line(result_img, (square_x, square_y + square_height), 
-                                (square_x + square_width, square_y + square_height), (0, 255, 0), 2)
-                    
-                    # Get square ROI and detect piece
-                    square_roi = get_square_roi(img, square_x, square_y, square_width, square_height)
-                    has_piece, is_white, piece_type = detect_piece(square_roi)
-                    
-                    # Get square notation
-                    square_notation = f"{chr(97+col)}{8-row}"
-                    
-                    if has_piece:
-                        # Draw piece indicator
-                        color = (255, 255, 255) if is_white else (0, 0, 0)
-                        cv2.circle(result_img, 
-                                 (square_x + square_width//2, square_y + square_height//2),
-                                 square_width//3, color, -1)  # Filled circle
-                        cv2.circle(result_img, 
-                                 (square_x + square_width//2, square_y + square_height//2),
-                                 square_width//3, (0, 0, 255), 2)  # Red outline
-                        
-                        # Add piece information
-                        pieces.append({
-                            'position': square_notation,
-                            'color': 'white' if is_white else 'black',
-                            'type': piece_type
-                        })
-                        
-                        # Add text label
-                        label = f"{piece_type[0].upper()}"
-                        text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
-                        text_x = square_x + (square_width - text_size[0]) // 2
-                        text_y = square_y + (square_height + text_size[1]) // 2
-                        
-                        # Draw text background
-                        padding = 4
-                        cv2.rectangle(result_img, 
-                                    (text_x - padding, text_y - text_size[1] - padding),
-                                    (text_x + text_size[0] + padding, text_y + padding),
-                                    (255, 255, 255), -1)
-                        
-                        # Draw text
-                        cv2.putText(result_img, label, 
-                                  (text_x, text_y),
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-                    else:
-                        empty_squares.append(square_notation)
-            
-            cv2.putText(result_img, "Possible 8x8 Chessboard", (x, y-10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
-            
-            # Log the board state
-            log_board_state(pieces, empty_squares)
-            
-            print("Found a possible chessboard using edge detection")
-            return result_img, (x, y, x+w, y+h), pieces
+            board_found = True
         else:
-            print("No chessboard detected using any method")
-            # Draw a message on the image
-            cv2.putText(result_img, "No Chessboard Detected", (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-            # Log empty state
-            log_board_state([], [])
-            return result_img, None, []
+            print("Chessboard not found!")
+            return
+    # Proceed with template matching if board is found
+    templates = load_templates(template_dir)
+    board_dict = {}
+    for row in range(8):
+        for col in range(8):
+            x = min_x + col * square_width
+            y = min_y + row * square_height
+            square_roi = img[y:y+square_height, x:x+square_width]
+            code, score = match_piece(square_roi, templates)
+            square = f"{chr(97+col)}{8-row}"
+            if code:
+                board_dict[square] = code
+                cv2.rectangle(result_img, (x, y), (x+square_width, y+square_height), (0, 0, 255), 2)
+                cv2.putText(result_img, code, (x+5, y+square_height-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+    cv2.imwrite(output_path, result_img)
+    print(f"Detection result saved to {output_path}")
+    # Generate FEN
+    fen = board_dict_to_fen(board_dict)
+    print(f"FEN: {fen}")
+    # Get best move from Stockfish
+    try:
+        best_move = best_move_from_fen(fen, engine_path)
+        print(f"Best move: {best_move}")
+    except Exception as e:
+        print(f"Error getting best move: {e}")
 
 def main():
     # Input and output file paths
-    input_file = "chessboard.png"
-    output_file = "detected-board.jpg"
-
-    # Check if input file exists
-    if not os.path.exists(input_file):
-        print(f"Error: Input file '{input_file}' not found")
-        return
-
+    input_image = 'chessboard.png'
+    output_image = 'detected-board.png'
+    template_dir = 'templates'
     try:
-        # Detect chessboard and get the processed image and crop coordinates
-        result_img, crop_coords, pieces = detect_chessboard(input_file)
-
-        if crop_coords is not None:
-            # Crop the image to the detected board area
-            min_x, min_y, max_x, max_y = crop_coords
-            cropped_img = result_img[min_y:max_y, min_x:max_x]
-            
-            # Save the cropped result
-            cv2.imwrite(output_file, cropped_img)
-            print(f"\nCropped chessboard saved as '{output_file}'")
-        else:
-            # Save the full image if no board was detected
-            cv2.imwrite(output_file, result_img)
-            print(f"\nFull image saved as '{output_file}' (no board detected)")
-
+        detect_chessboard_with_templates(input_image, template_dir=template_dir, output_path=output_image)
     except Exception as e:
-        print(f"Error processing image: {str(e)}")
+        print(f"Error processing image: {e}")
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main() 
